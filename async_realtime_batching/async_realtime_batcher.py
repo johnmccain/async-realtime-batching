@@ -35,9 +35,16 @@ class AsyncRealtimeBatcher(Generic[RequestT, ResponseT]):
         self.check_interval_seconds = check_interval_seconds
         self.func: Callable[[list[RequestT]], Awaitable[list[ResponseT]]] | None = None
         self.buffer: list[SubmittedCall] = []
-        self.buffer_monitor_task = asyncio.get_event_loop().create_task(
-            self._buffer_monitor()
-        )
+        self.buffer_monitor_task: asyncio.Task[None] | None = None
+
+    async def _start_monitor(self):
+        """
+        Create and start the monitor task if it is not already running. This should be called from an async context.
+        """
+        if (
+            self.buffer_monitor_task is None
+        ):  # Ensure we do not start multiple monitor tasks.
+            self.buffer_monitor_task = asyncio.create_task(self._buffer_monitor())
 
     def __call__(
         self,
@@ -57,6 +64,7 @@ class AsyncRealtimeBatcher(Generic[RequestT, ResponseT]):
 
         @functools.wraps(func)
         async def wrapper(requests: list[RequestT]) -> list[ResponseT]:
+            await self._start_monitor()
             submitted_call = SubmittedCall(
                 requests=requests,
                 submission_time=time.monotonic(),
