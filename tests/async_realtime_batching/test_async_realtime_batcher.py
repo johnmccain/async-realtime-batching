@@ -65,6 +65,7 @@ async def test_buffer_monitor_calls_process_batch_when_buffer_full():
         batch_size=2, max_wait_time_seconds=1000.0
     )
     async_realtime_batcher._process_batch = AsyncMock()
+    await async_realtime_batcher._start_monitor()
     async_realtime_batcher.buffer = [
         SubmittedCall(
             requests=[1, 2],
@@ -89,6 +90,7 @@ async def test_buffer_monitor_calls_process_batch_when_oldest_item_too_old():
         batch_size=1000, max_wait_time_seconds=0.01
     )
     async_realtime_batcher._process_batch = AsyncMock()
+    await async_realtime_batcher._start_monitor()
     async_realtime_batcher.buffer = [
         SubmittedCall(
             requests=[1, 2],
@@ -108,7 +110,6 @@ async def test_process_batch_processes_batch():
         batch_size=2, max_wait_time_seconds=1000.0
     )
     # cancel the buffer monitor task so it doesn't interfere with this test
-    async_realtime_batcher.buffer_monitor_task.cancel()
     async_realtime_batcher.func = AsyncMock(side_effect=lambda x: x)
     async_realtime_batcher.buffer = [
         SubmittedCall(
