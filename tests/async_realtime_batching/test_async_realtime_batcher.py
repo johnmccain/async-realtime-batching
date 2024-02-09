@@ -65,17 +65,18 @@ async def test_buffer_monitor_calls_process_batch_when_buffer_full():
         batch_size=2, max_wait_time_seconds=1000.0
     )
     async_realtime_batcher._process_batch = AsyncMock()
-    await async_realtime_batcher._start_monitor()
     async_realtime_batcher.buffer = [
         SubmittedCall(
             requests=[1, 2],
             submission_time=time.monotonic(),
             future=asyncio.get_event_loop().create_future(),
+            callback_event_loop=asyncio.get_event_loop(),
         ),
         SubmittedCall(
             requests=[3, 4],
             submission_time=time.monotonic(),
             future=asyncio.get_event_loop().create_future(),
+            callback_event_loop=asyncio.get_event_loop(),
         ),
     ]
 
@@ -90,12 +91,12 @@ async def test_buffer_monitor_calls_process_batch_when_oldest_item_too_old():
         batch_size=1000, max_wait_time_seconds=0.01
     )
     async_realtime_batcher._process_batch = AsyncMock()
-    await async_realtime_batcher._start_monitor()
     async_realtime_batcher.buffer = [
         SubmittedCall(
             requests=[1, 2],
             submission_time=time.monotonic() - 0.2,
             future=asyncio.get_event_loop().create_future(),
+            callback_event_loop=asyncio.get_event_loop(),
         ),
     ]
 
@@ -109,18 +110,21 @@ async def test_process_batch_processes_batch():
     async_realtime_batcher = AsyncRealtimeBatcher(
         batch_size=2, max_wait_time_seconds=1000.0
     )
-    # cancel the buffer monitor task so it doesn't interfere with this test
+    # Stop the buffer monitor so it doesn't interfere with the test
+    async_realtime_batcher.stop()
     async_realtime_batcher.func = AsyncMock(side_effect=lambda x: x)
     async_realtime_batcher.buffer = [
         SubmittedCall(
             requests=[1, 2],
             submission_time=time.monotonic(),
             future=asyncio.get_event_loop().create_future(),
+            callback_event_loop=asyncio.get_event_loop(),
         ),
         SubmittedCall(
             requests=[3, 4],
             submission_time=time.monotonic(),
             future=asyncio.get_event_loop().create_future(),
+            callback_event_loop=asyncio.get_event_loop(),
         ),
     ]
 
@@ -128,3 +132,33 @@ async def test_process_batch_processes_batch():
 
     async_realtime_batcher.func.assert_called_once_with([1, 2, 3, 4])
     assert async_realtime_batcher.buffer == []
+
+
+@pytest.mark.asyncio
+async def test_process_batch_sets_exception_on_futures_when_exception_raised():
+    async_realtime_batcher = AsyncRealtimeBatcher(
+        batch_size=2, max_wait_time_seconds=1000.0
+    )
+    # Stop the buffer monitor so it doesn't interfere with the test
+    async_realtime_batcher.stop()
+    async_realtime_batcher.func = AsyncMock(side_effect=Exception("error"))
+    async_realtime_batcher.buffer = [
+        SubmittedCall(
+            requests=[1, 2],
+            submission_time=time.monotonic(),
+            future=asyncio.get_event_loop().create_future(),
+            callback_event_loop=asyncio.get_event_loop(),
+        ),
+        SubmittedCall(
+            requests=[3, 4],
+            submission_time=time.monotonic(),
+            future=asyncio.get_event_loop().create_future(),
+            callback_event_loop=asyncio.get_event_loop(),
+        ),
+    ]
+
+    await async_realtime_batcher._process_batch()
+
+    for call in async_realtime_batcher.buffer:
+        with pytest.raises(Exception):
+            await call.future
