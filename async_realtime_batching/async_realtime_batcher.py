@@ -1,6 +1,7 @@
 import asyncio
 import functools
 import itertools
+import threading
 import time
 from typing import Awaitable, Callable, Generic, NamedTuple, TypeVar
 
@@ -12,6 +13,7 @@ class SubmittedCall(NamedTuple, Generic[RequestT, ResponseT]):
     requests: list[RequestT]
     submission_time: float
     future: asyncio.Future[ResponseT]
+    callback_event_loop: asyncio.AbstractEventLoop
 
 
 class AsyncRealtimeBatcher(Generic[RequestT, ResponseT]):
@@ -34,17 +36,35 @@ class AsyncRealtimeBatcher(Generic[RequestT, ResponseT]):
         self.max_wait_time_seconds = max_wait_time_seconds
         self.check_interval_seconds = check_interval_seconds
         self.func: Callable[[list[RequestT]], Awaitable[list[ResponseT]]] | None = None
-        self.buffer: list[SubmittedCall] = []
-        self.buffer_monitor_task: asyncio.Task[None] | None = None
 
-    async def _start_monitor(self):
+        self.buffer_lock = threading.Lock()
+        self.buffer: list[SubmittedCall] = []
+
+        self.stop_event = threading.Event()
+        self.buffer_monitor_thread = threading.Thread(
+            target=self._start_monitor, daemon=True
+        )
+        self.buffer_monitor_thread.start()
+
+    def stop(self, join: bool = True):
         """
-        Create and start the monitor task if it is not already running. This should be called from an async context.
+        Stop the buffer monitor thread. Calling this method is optional.
+        :param join: Whether to join the buffer monitor thread. Defaults to True. The buffer monitor thread is a daemon
+            thread, so it will not prevent the program from exiting if it is not joined.
         """
-        if (
-            self.buffer_monitor_task is None
-        ):  # Ensure we do not start multiple monitor tasks.
-            self.buffer_monitor_task = asyncio.create_task(self._buffer_monitor())
+        self.stop_event.set()
+        if join:
+            self.buffer_monitor_thread.join()
+
+    def _start_monitor(self):
+        """
+        Start the buffer monitor loop. This method should be called in a separate thread. This method is required to
+        start the new event loop for the buffer monitor.
+        """
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(self._buffer_monitor())
+        loop.close()
 
     def __call__(
         self,
@@ -64,13 +84,14 @@ class AsyncRealtimeBatcher(Generic[RequestT, ResponseT]):
 
         @functools.wraps(func)
         async def wrapper(requests: list[RequestT]) -> list[ResponseT]:
-            await self._start_monitor()
             submitted_call = SubmittedCall(
                 requests=requests,
                 submission_time=time.monotonic(),
                 future=asyncio.get_event_loop().create_future(),
+                callback_event_loop=asyncio.get_event_loop(),
             )
-            self.buffer.append(submitted_call)
+            with self.buffer_lock:
+                self.buffer.append(submitted_call)
             return await submitted_call.future
 
         return wrapper
@@ -82,14 +103,25 @@ class AsyncRealtimeBatcher(Generic[RequestT, ResponseT]):
         if not self.func:
             raise ValueError("No function has been set for this batcher.")
 
-        batch_to_process = self.buffer[: self.batch_size]
-        if not batch_to_process:
-            return
+        with self.buffer_lock:
+            batch_to_process = self.buffer[: self.batch_size]
+            if not batch_to_process:
+                return
+            self.buffer = self.buffer[len(batch_to_process) :]
 
         combined_requests = itertools.chain(
             *[call.requests for call in batch_to_process]
         )
-        combined_responses = await self.func(list(combined_requests))
+        try:
+            combined_responses = await self.func(list(combined_requests))
+        except Exception as e:  # pylint: disable=broad-except
+            # If an exception is raised, set the exception on all the futures in the batch
+            for call in batch_to_process:
+                call.callback_event_loop.call_soon_threadsafe(
+                    call.future.set_exception,
+                    e,
+                )
+            return
         separated_responses = []
         i = 0
         for call in batch_to_process:
@@ -97,27 +129,34 @@ class AsyncRealtimeBatcher(Generic[RequestT, ResponseT]):
             i += len(call.requests)
 
         for call, responses in zip(batch_to_process, separated_responses):
-            call.future.set_result(responses)
-
-        self.buffer = self.buffer[len(batch_to_process) :]
+            # Schedule the setting of the result on the event loop that the call originated from
+            call.callback_event_loop.call_soon_threadsafe(
+                call.future.set_result,
+                responses,
+            )
 
     async def _buffer_monitor(self):
         """
-        Loop forever, checking the buffer for items to process. If the buffer is full or the oldest item has been
-        waiting too long, process the batch.
+        Loop until stop event is set, checking the buffer for items to process. If the buffer is full or the oldest
+        item has been waiting too long, process the batch.
         """
-        while True:
+        while not self.stop_event.is_set():
             current_time = time.monotonic()
             # each item in the buffer can contain multiple requests, so we need to account for that when checking the
             # buffer size
-            buffer_size = sum(len(call.requests) for call in self.buffer)
-            if buffer_size >= self.batch_size:
+            with self.buffer_lock:
+                buffer_size = sum(len(call.requests) for call in self.buffer)
+                buffer_size_over_limit = buffer_size >= self.batch_size
+                oldest_call = self.buffer[0] if self.buffer else None
+                oldest_call_over_time_limit = (
+                    oldest_call
+                    and current_time - oldest_call.submission_time
+                    >= self.max_wait_time_seconds
+                )
+                should_process = buffer_size_over_limit or oldest_call_over_time_limit
+            if should_process:
                 await self._process_batch()
-            elif (
-                self.buffer
-                and current_time - self.buffer[0].submission_time
-                >= self.max_wait_time_seconds
-            ):
-                await self._process_batch()
-
-            await asyncio.sleep(self.check_interval_seconds)
+            else:
+                # Sleep if the buffer wasn't processed. Don't sleep if the buffer was processed, so we can check
+                # the buffer again immediately.
+                await asyncio.sleep(self.check_interval_seconds)
